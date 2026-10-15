@@ -1,0 +1,6 @@
+python-telegram-bot>=20,<23
+openai>=1,<3
+understatapi
+python-dotenv>=1,<2
+fastapi>=0.110,<1
+uvicorn>=0.27,<1
