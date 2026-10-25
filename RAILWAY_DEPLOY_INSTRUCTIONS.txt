@@ -1,0 +1,15 @@
+PLAYERS HISTORY — Railway deployment package
+
+1. Back up the current GitHub repository before changing anything.
+2. In the repository ekekjghf-lab/players-history (branch main), update:
+   app.py
+   football_normalized.db
+   requirements.txt
+   static/index.html
+   and static/photos/ if needed.
+3. Do NOT upload .env, .git, local backup databases or API tokens.
+4. Railway service Variables: check DB_NAME. If present and set to football.db, change it to football_normalized.db; otherwise leave unset.
+5. Start command: uvicorn app:app --host 0.0.0.0 --port $PORT (if a start command is needed).
+6. Railway will redeploy after push to main. Verify /api/health and /api/rpl/stats, /api/rpl/clubs and a player profile.
+7. This deployment bundles SQLite with code. If Railway uses a persistent volume or a DB_NAME override, review that before deploying. Do not overwrite a live writable database.
+8. Existing /api/players still serves the 207 historical players; the RPL section uses current_rpl_rosters (376 rows, 375 unique names) and player_profiles.
