@@ -4,6 +4,7 @@ import datetime
 from openai import AsyncOpenAI
 import asyncio
 import logging
+from pathlib import Path
 from html import escape
 from contextlib import closing
 from seed_data import seed_players, seed_clubs
@@ -345,111 +346,107 @@ async def refresh_from_understat(query, context, player_id):
 
 # ==================== ИИ (OPENROUTER) ====================
 
+NORMALIZED_DB = Path(__file__).resolve().parent / 'football_normalized.db'
+
+
+def _norm_text(value):
+    return ' '.join((value or '').casefold().replace('ё', 'е').split())
+
+
+def get_extended_player_data(player_name):
+    """Дополнительный AI-контекст из расширенной football_normalized.db."""
+    if not NORMALIZED_DB.exists():
+        return None
+    conn = sqlite3.connect(str(NORMALIZED_DB), timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        profiles = conn.execute("""SELECT player_name, full_name, birth_date, citizenship, height_cm,
+            weight_kg, preferred_foot, current_club, position, shirt_number FROM player_profiles""").fetchall()
+        target = _norm_text(player_name)
+        profile = next((r for r in profiles if _norm_text(r['player_name']) == target), None)
+        if profile is None:
+            profile = next((r for r in profiles if target in _norm_text(r['player_name']) or _norm_text(r['player_name']) in target), None)
+        if profile is None:
+            return None
+        canonical = profile['player_name']
+        career = conn.execute("""SELECT club_name, date_from, date_to, appearances, goals, assists
+            FROM player_career WHERE player_name = ?
+            ORDER BY COALESCE(date_to, '9999') DESC, COALESCE(date_from, '') DESC LIMIT 20""", (canonical,)).fetchall()
+        seasons = conn.execute("""SELECT season, competition, club_name, appearances, starts, minutes,
+            goals, assists, yellow_cards, red_cards, shots, shots_on_target, penalties_scored,
+            penalties_missed, winning_goals, xg, xa FROM player_season_stats WHERE player_name = ?
+            ORDER BY season DESC, competition LIMIT 30""", (canonical,)).fetchall()
+        totals = conn.execute("""SELECT COALESCE(SUM(appearances),0), COALESCE(SUM(goals),0),
+            COALESCE(SUM(assists),0) FROM player_career WHERE player_name = ?""", (canonical,)).fetchone()
+        return {'profile': dict(profile), 'career': [dict(r) for r in career], 'seasons': [dict(r) for r in seasons],
+                'career_totals': {'appearances': totals[0], 'goals': totals[1], 'assists': totals[2]}}
+    finally:
+        conn.close()
+
+
+def build_ai_context(player, extended):
+    lines = ['ДАННЫЕ ИЗ ЛОКАЛЬНОЙ БАЗЫ PLAYERS HISTORY:', f'Имя: {player[1]}',
+             f'Позиция (старая карточка): {player[4] or "нет данных"}', f'Клуб (старая карточка): {player[5] or "нет данных"}']
+    if not extended:
+        lines += [f'Матчи (старая карточка): {player[7] or 0}', f'Голы (старая карточка): {player[6] or 0}']
+        return '\n'.join(lines)
+    p = extended['profile']
+    lines += ['', 'ПРОФИЛЬ:', f"Полное имя: {p.get('full_name') or p.get('player_name')}",
+              f"Дата рождения: {p.get('birth_date') or 'нет данных'}", f"Гражданство: {p.get('citizenship') or 'нет данных'}",
+              f"Рост: {p.get('height_cm') or 'нет данных'} см", f"Вес: {p.get('weight_kg') or 'нет данных'} кг",
+              f"Рабочая нога: {p.get('preferred_foot') or 'нет данных'}", f"Текущий клуб: {p.get('current_club') or 'нет данных'}",
+              f"Позиция: {p.get('position') or 'нет данных'}", f"Номер: {p.get('shirt_number') or 'нет данных'}"]
+    totals = extended['career_totals']
+    lines += ['', 'ИТОГО ПО ЗАПИСЯМ КАРЬЕРЫ:', f"Матчи: {totals['appearances']}; голы: {totals['goals']}; ассисты: {totals['assists']}"]
+    if extended['career']:
+        lines.append('\nКАРЬЕРА (до 20 последних записей):')
+        for r in extended['career']:
+            lines.append(f"- {r['club_name']}: {r.get('date_from') or '?'} — {r.get('date_to') or 'н.в.'}; матчи {r.get('appearances') or 0}, голы {r.get('goals') or 0}, ассисты {r.get('assists') or 0}")
+    if extended['seasons']:
+        lines.append('\nСЕЗОННАЯ СТАТИСТИКА (до 30 последних записей):')
+        for r in extended['seasons']:
+            extra=[]
+            if r.get('xg') is not None: extra.append(f"xG {r['xg']}")
+            if r.get('xa') is not None: extra.append(f"xA {r['xa']}")
+            lines.append(f"- {r['season']} | {r['competition']} | {r['club_name']}: матчи {r.get('appearances') or 0}, старты {r.get('starts') or 0}, минуты {r.get('minutes') or 0}, голы {r.get('goals') or 0}, ассисты {r.get('assists') or 0}" + (f"; {', '.join(extra)}" if extra else ''))
+    return '\n'.join(lines)
+
+
 async def ask_deepseek(query, context, player_id):
     global ai_client
     if not OPENROUTER_API_KEY:
-        await query.message.reply_text(t(context, 'ai_error'))
+        await query.message.reply_text('🤖 ИИ пока не подключён на сервере. Добавь OPENROUTER_API_KEY в Variables сервиса бота на Railway.')
         return
     if ai_client is None:
-        ai_client = AsyncOpenAI(api_key=OPENROUTER_API_KEY, base_url='https://openrouter.ai/api/v1', timeout=30, max_retries=1)
+        ai_client = AsyncOpenAI(api_key=OPENROUTER_API_KEY, base_url='https://openrouter.ai/api/v1', timeout=45, max_retries=2)
     player = get_player_by_id(player_id)
     if not player:
-        await query.message.reply_text(t(context, 'ai_error'))
-        return
-
-    player_name = player[1]
-    player_name_latin = player[2] if player[2] else player[1]
-    player_club = player[5] if player[5] else "unknown"
-    player_position = player[4] if player[4] else "unknown"
-    player_year = player[3] if player[3] else "unknown"
-    player_goals = player[6]
-    player_games = player[7]
-
+        await query.message.reply_text(t(context, 'ai_error')); return
+    extended = get_extended_player_data(player[1])
+    database_context = build_ai_context(player, extended)
     try:
-        await context.bot.send_chat_action(
-            chat_id=query.message.chat_id,
-            action="typing"
-        )
-    except Exception as e:
-        print(f"chat_action error: {e}")
-
-    lang = get_lang(context)
-    if lang == 'en':
-        system_prompt = (
-            "You are an expert on Russian football. Answer briefly, to the point, "
-            "using the most up-to-date information you know. Always answer in English."
-        )
-        user_prompt = (
-            f"Tell me the latest information about the footballer {player_name_latin}. "
-            f"Here's what we have in our database:\n"
-            f"- Position: {player_position}\n"
-            f"- Birth year: {player_year}\n"
-            f"- Club (in our DB): {player_club}\n"
-            f"- Goals: {player_goals}\n"
-            f"- Matches: {player_games}\n\n"
-            f"Add more context: talk about his career, achievements, "
-            f"current club, playing style. Keep it in 8-10 sentences."
-        )
+        await context.bot.send_chat_action(chat_id=query.message.chat_id, action='typing')
+    except Exception:
+        pass
+    if get_lang(context) == 'en':
+        system_prompt = ('You are Players History AI, a football analyst specializing in Russian football. The database context is the primary source of truth for numbers. Never invent statistics, clubs, dates, achievements, injuries or transfers. If a fact is absent, say the database does not confirm it. Distinguish database facts from analysis. Answer with: profile, career/statistics, style/analysis, conclusion.')
+        user_prompt = f'Analyze this player using the Players History database below.\n\n{database_context}'
     else:
-        system_prompt = (
-            "Ты — эксперт по российскому футболу. Ты отвечаешь кратко, по делу, "
-            "используя актуальную информацию. Отвечай на русском языке."
-        )
-        user_prompt = (
-            f"Расскажи актуальную информацию о футболисте {player_name}. "
-            f"Вот что есть в базе:\n"
-            f"- Позиция: {player_position}\n"
-            f"- Год рождения: {player_year}\n"
-            f"- Клуб (по базе): {player_club}\n"
-            f"- Голы: {player_goals}\n"
-            f"- Матчи: {player_games}\n\n"
-            f"Дополни информацию: расскажи о его карьере, достижениях, "
-            f"текущем клубе, стиле игры. Уложись в 8-10 предложений."
-        )
-
+        system_prompt = ('Ты — Players History AI, футбольный аналитик по российскому футболу. Контекст базы Players History — главный источник истины для цифр. Никогда не выдумывай статистику, клубы, даты, достижения, травмы или трансферы. Если факта нет в базе, прямо скажи об этом. Отделяй факты базы от аналитической оценки. Ответ: профиль, карьера/статистика, стиль и аналитика, вывод. Пиши понятно и компактно на русском.')
+        user_prompt = f'Проанализируй футболиста по данным Players History ниже.\n\n{database_context}'
     try:
-        answer = None
-        attempts = 0
-        max_attempts = 3
-
-        while attempts < max_attempts:
-            attempts += 1
-
-            try:
-                await context.bot.send_chat_action(
-                    chat_id=query.message.chat_id,
-                    action="typing"
-                )
-            except Exception as e:
-                print(f"chat_action error: {e}")
-
-            response = await ai_client.chat.completions.create(
-                model=os.getenv("OPENROUTER_MODEL", "inclusionai/ling-3.0-flash-sante:free"),
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                stream=False,
-                max_tokens=800
-            )
-
-            answer = response.choices[0].message.content
-
-            if answer and answer.strip() and answer.strip().lower() != "none":
-                break
-
-            print(f"Попытка {attempts}: пустой ответ, пробуем снова...")
-
-        if not answer or not answer.strip() or answer.strip().lower() == "none":
-            await query.message.reply_text(t(context, 'ai_empty'))
-            return
-
-        full_text = f"🤖 {player_name}\n\n{answer}"
-        for offset in range(0, len(full_text), 4000):
-            await query.message.reply_text(full_text[offset:offset + 4000])
-
+        response = await ai_client.chat.completions.create(
+            model=os.getenv('OPENROUTER_MODEL', 'openrouter/free'),
+            messages=[{'role':'system','content':system_prompt},{'role':'user','content':user_prompt}],
+            stream=False, max_tokens=1100, temperature=0.25)
+        answer=(response.choices[0].message.content or '').strip()
+        if not answer:
+            await query.message.reply_text(t(context, 'ai_empty')); return
+        full_text=f"🤖 {player[1]} • Players History AI\n\n{answer}"
+        for offset in range(0,len(full_text),4000):
+            await query.message.reply_text(full_text[offset:offset+4000])
     except Exception as e:
-        print(f"OpenRouter error: {e}")
+        logging.exception('OpenRouter AI error: %s', e)
         await query.message.reply_text(t(context, 'ai_error'))
 
 
