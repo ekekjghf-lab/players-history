@@ -389,6 +389,34 @@ def rpl_clubs():
                     FROM current_rpl_rosters WHERE season=?
                     GROUP BY club_name ORDER BY club_name COLLATE NOCASE''', (RPL_SEASON,))
 
+
+
+def _rpl_photo_record(roster_id: int):
+    """Read an official squad photo linked to the roster row; never write to the DB."""
+    try:
+        rows = fetch(
+            """SELECT image_url, source_page, source_name, identity_status
+               FROM player_photos WHERE roster_id=? LIMIT 1""",
+            (roster_id,)
+        )
+    except sqlite3.OperationalError:
+        # Older databases may not contain the photo registry table yet.
+        return None
+    if not rows:
+        return None
+    photo = rows[0]
+    image_url = str(photo.get('image_url') or '').strip()
+    if not image_url.startswith('https://'):
+        return None
+    return {
+        'image_url': image_url,
+        'source_page': photo.get('source_page'),
+        'source_name': photo.get('source_name'),
+        'identity_status': photo.get('identity_status')
+    }
+
+
+
 @app.get('/api/rpl/clubs/{club_name}/players')
 def rpl_club_players(club_name: str):
     club_name = club_name.strip()
@@ -403,7 +431,74 @@ def rpl_club_players(club_name: str):
                              shirt_number, player_name''', (RPL_SEASON, club_name))
     if not rows:
         raise HTTPException(404, 'RPL club not found')
+    for row in rows:
+        photo = _rpl_photo_record(row['roster_id'])
+        row['photo_url'] = photo['image_url'] if photo else None
     return {'season': RPL_SEASON, 'club': club_name, 'players_count': len(rows), 'players': rows}
+
+@lru_cache(maxsize=1024)
+def rpl_verified_photo(name: str, birth_year: int):
+    # Search verified Wikidata portraits.
+    if not name or not birth_year or len(name.split()) < 2:
+        return None
+    try:
+        search_url = 'https://www.wikidata.org/w/api.php?' + urlencode({
+            'action': 'wbsearchentities', 'search': name, 'language': 'ru',
+            'uselang': 'ru', 'type': 'item', 'limit': 10, 'format': 'json'
+        })
+        ids = [x['id'] for x in _get_json(search_url).get('search', []) if x.get('id')]
+        if not ids:
+            return None
+        entity_url = 'https://www.wikidata.org/w/api.php?' + urlencode({
+            'action': 'wbgetentities', 'ids': '|'.join(ids),
+            'props': 'claims|labels|descriptions', 'languages': 'ru', 'format': 'json'
+        })
+        entities = _get_json(entity_url).get('entities', {})
+        surname = name.split()[0].casefold()  # RPL roster names are typically surname first.
+        for qid in ids:
+            entity = entities.get(qid, {})
+            if _claim_year(entity, 'P569') != int(birth_year):
+                continue
+            label = entity.get('labels', {}).get('ru', {}).get('value', '').casefold()
+            desc = entity.get('descriptions', {}).get('ru', {}).get('value', '').casefold()
+            if surname not in label or not any(x in desc for x in ('футболист', 'football', 'soccer')):
+                continue
+            claims = entity.get('claims', {}).get('P18', [])
+            if claims:
+                filename = claims[0]['mainsnak']['datavalue']['value']
+                photo = _commons_thumbnail(filename)
+                if photo:
+                    return photo
+    except (OSError, ValueError, TimeoutError, KeyError, IndexError, TypeError):
+        pass
+    return None
+
+
+@app.get('/api/rpl/photo/{roster_id}')
+def rpl_photo(roster_id: int):
+    rows = fetch('''SELECT r.player_name, p.birth_date
+                    FROM current_rpl_rosters r
+                    LEFT JOIN player_profiles p ON p.player_name = r.player_name
+                    WHERE r.rowid=? AND r.season=? LIMIT 1''', (roster_id, RPL_SEASON))
+    if not rows:
+        raise HTTPException(404, 'RPL player not found')
+    official_photo = _rpl_photo_record(roster_id)
+    if official_photo:
+        return RedirectResponse(
+            official_photo['image_url'],
+            status_code=302,
+            headers={'Cache-Control': 'public, max-age=86400'}
+        )
+    row = rows[0]
+    date = str(row.get('birth_date') or '')
+    year = int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else 0
+    url = rpl_verified_photo(row['player_name'], year)
+    if url:
+        return RedirectResponse(url, status_code=302,
+                                headers={'Cache-Control': 'public, max-age=604800'})
+    return Response(status_code=404, headers={'Cache-Control': 'public, max-age=21600'})
+
+
 
 @app.get('/api/rpl/players/{roster_id}')
 def rpl_player_profile(roster_id: int):
@@ -416,6 +511,12 @@ def rpl_player_profile(roster_id: int):
 
     base = rows[0]
     name = base['player_name']
+    photo = _rpl_photo_record(roster_id)
+    base['photo_url'] = photo['image_url'] if photo else None
+    base['photo_source_page'] = photo['source_page'] if photo else None
+    base['photo_source_name'] = photo['source_name'] if photo else None
+    base['photo_identity_status'] = photo['identity_status'] if photo else None
+
 
     profiles = fetch('SELECT * FROM player_profiles WHERE player_name=?', (name,))
     season_stats = fetch('''SELECT * FROM player_season_stats
@@ -463,7 +564,12 @@ def rpl_player_search(q: str = Query('', max_length=100),
                WHEN 'Полузащитник' THEN 3 WHEN 'Нападающий' THEN 4 ELSE 5 END,
                shirt_number, player_name LIMIT ? OFFSET ?'''
     args.extend([limit, offset])
-    return fetch(sql, tuple(args))
+    rows = fetch(sql, tuple(args))
+    for row in rows:
+        photo = _rpl_photo_record(row['roster_id'])
+        row['photo_url'] = photo['image_url'] if photo else None
+    return rows
+
 
 
 
